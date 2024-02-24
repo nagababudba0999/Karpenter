@@ -1,0 +1,285 @@
+---------------------------------------------------------------------------------------------------------------------------------------
+##Create these environment variables:
+---------------------------------------------------------------------------------------------------------------------------------------
+export CLUSTER_NAME=CLUSTER_NAME
+    
+export KARPENTER_VERSION=v0.25.0
+    
+export CLUSTER_ENDPOINT="$(aws eks describe-cluster --name ${CLUSTER_NAME} --query "cluster.endpoint" --output text)"
+    
+export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
+
+---------------------------------------------------------------------------------------------------------------------------------------
+
+##Run the following command to create the node-role-trust-relationship.json file.
+
+cat >node-role-trust-relationship.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ec2.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}
+EOF
+
+####### Create the IAM role #######
+
+aws iam create-role --role-name KarpenterInstanceNodeRole --assume-role-policy-document file://"node-role-trust-relationship.json"
+
+
+####### Attach below required IAM managed policies to the KarpenterInstanceNodeRole IAM role #######
+
+aws iam attach-role-policy --policy-arn arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy --role-name KarpenterInstanceNodeRole
+aws iam attach-role-policy --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly --role-name KarpenterInstanceNodeRole
+aws iam attach-role-policy --policy-arn arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy --role-name KarpenterInstanceNodeRole
+aws iam attach-role-policy --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore --role-name KarpenterInstanceNodeRole
+
+---------------------------------------------------------------------------------------------------------------------------------------
+
+####### Configure the IAM role for the Karpenter controller #######
+Create an IAM role for KarpenterControllerRole. The Karpenter controller uses the IAM roles for Service Accounts (IRSA).
+
+####### Create a controller-policy.json document with the following permissions: #######
+
+echo '{
+    "Statement": [
+        {
+            "Action": [
+                "ssm:GetParameter",
+                "iam:PassRole",
+                "ec2:DescribeImages",
+                "ec2:RunInstances",
+                "ec2:DescribeSubnets",
+                "ec2:DescribeSecurityGroups",
+                "ec2:DescribeLaunchTemplates",
+                "ec2:DescribeInstances",
+                "ec2:DescribeInstanceTypes",
+                "ec2:DescribeInstanceTypeOfferings",
+                "ec2:DescribeAvailabilityZones",
+                "ec2:DeleteLaunchTemplate",
+                "ec2:CreateTags",
+                "ec2:CreateLaunchTemplate",
+                "ec2:CreateFleet",
+                "ec2:DescribeSpotPriceHistory",
+                "pricing:GetProducts"
+            ],
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "Karpenter"
+        },
+        {
+            "Action": "ec2:TerminateInstances",
+            "Condition": {
+                "StringLike": {
+                    "ec2:ResourceTag/Name": "*karpenter*"
+                }
+            },
+            "Effect": "Allow",
+            "Resource": "*",
+            "Sid": "ConditionalEC2Termination"
+        }
+    ],
+    "Version": "2012-10-17"
+}' > controller-policy.json
+
+####### Create an IAM policy using this controller-policy.json document. #######
+
+aws iam create-policy --policy-name KarpenterControllerPolicy-${CLUSTER_NAME} --policy-document file://controller-policy.json
+
+####### Create an IAM OIDC identity provider for your cluster using this eksctl command #######
+
+eksctl utils associate-iam-oidc-provider --cluster ${CLUSTER_NAME} --approve --region us-east-1
+
+####### Create the IAM role for Karpenter Controller using the eksctl command. Associate the Kubernetes Service Account and the IAM role using IRSA. #######
+
+eksctl create iamserviceaccount \
+  --cluster "${CLUSTER_NAME}" --name karpenter --namespace karpenter \
+  --role-name "KarpenterControllerRole-${CLUSTER_NAME}" \
+  --attach-policy-arn "arn:aws:iam::${AWS_ACCOUNT_ID}:policy/KarpenterControllerPolicy-${CLUSTER_NAME}" \
+  --role-only \
+  --approve --region us-east-1
+
+---------------------------------------------------------------------------------------------------------------------------------------
+
+####### Add tags to subnets and security groups #######
+Add tags to node group subnets so that Karpenter knows the subnets to use.
+
+for NODEGROUP in $(aws eks list-nodegroups --cluster-name ${CLUSTER_NAME} \
+    --query 'nodegroups' --output text); do aws ec2 create-tags \
+        --tags "Key=karpenter.sh/discovery,Value=${CLUSTER_NAME}" \
+        --resources $(aws eks describe-nodegroup --cluster-name ${CLUSTER_NAME} \
+        --nodegroup-name $NODEGROUP --query 'nodegroup.subnets' --output text )
+done
+
+####### Add tags to security groups. #######
+
+NODEGROUP=$(aws eks list-nodegroups --cluster-name ${CLUSTER_NAME} --query 'nodegroups[0]' --output text)
+ 
+LAUNCH_TEMPLATE=$(aws eks describe-nodegroup --cluster-name ${CLUSTER_NAME} --nodegroup-name ${NODEGROUP} --query 'nodegroup.launchTemplate.{id:id,version:version}' --output text | tr -s "\t" ",")
+ 
+# If your EKS setup is configured to use only Cluster security group, then please execute -
+ 
+SECURITY_GROUPS=$(aws eks describe-cluster --name ${CLUSTER_NAME} --query cluster.resourcesVpcConfig.clusterSecurityGroupId | tr -d '"')
+ 
+# If your setup uses the security groups in the Launch template of a managed node group, then :
+ 
+#SECURITY_GROUPS=$(aws ec2 describe-launch-template-versions \
+#    --launch-template-id ${LAUNCH_TEMPLATE%,*} --versions ${LAUNCH_TEMPLATE#*,} \
+#    --query 'LaunchTemplateVersions[0].LaunchTemplateData.[NetworkInterfaces[0].Groups||SecurityGroupIds]' \
+#    --output text)
+ 
+aws ec2 create-tags --tags "Key=karpenter.sh/discovery,Value=${CLUSTER_NAME}" --resources ${SECURITY_GROUPS}
+
+aws iam create-instance-profile --instance-profile-name "KarpenterNodeInstanceProfile"
+
+aws iam add-role-to-instance-profile --instance-profile-name "KarpenterNodeInstanceProfile" --role-name "KarpenterInstanceNodeRole"
+
+
+---------------------------------------------------------------------------------------------------------------------------------------
+
+####### Update aws-auth ConfigMap #######
+
+Update the aws-auth ConfigMap in the cluster to allow the nodes that use the KarpenterInstanceNodeRole IAM role to join the cluster. Run the following command:
+
+kubectl edit configmap aws-auth -n kube-system
+
+####### Add a section to mapRoles that looks similar to this example: #######
+
+Note: Replace the ${AWS_ACCOUNT_ID} variable with your account, but don't replace {{EC2PrivateDNSName}}.
+
+- groups:
+  - system:bootstrappers
+  - system:nodes
+  rolearn: arn:aws:iam::175284329755:role/KarpenterInstanceNodeRole
+  username: system:node:{{EC2PrivateDNSName}} 
+
+
+' ###The full aws-auth ConfigMap now has two groups: one for your Karpenter node role and one for your existing node group.
+---------------------------------------------------------------------------------------------------------------------------------------
+####### Deploy Karpenter #######
+
+####### Verify the version of the Karpenter release that you want to deploy using this command: #######
+
+echo $KARPENTER_VERSION
+
+#If you don't see any output or see a different version than desired, then run:
+
+export KARPENTER_VERSION=v0.25.0
+
+  Generate a full Karpenter deployment yaml file from the Helm chart. Before you begin, make sure that the Helm client version is v3.11.0 or later. #######
+
+helm template karpenter oci://public.ecr.aws/karpenter/karpenter --version ${KARPENTER_VERSION} --namespace karpenter \
+    --set settings.aws.defaultInstanceProfile=KarpenterNodeInstanceProfile \
+    --set settings.aws.clusterEndpoint="${CLUSTER_ENDPOINT}" \
+    --set settings.aws.clusterName=${CLUSTER_NAME} \
+    --set serviceAccount.annotations."eks\.amazonaws\.com/role-arn"="arn:aws:iam::${AWS_ACCOUNT_ID}:role/KarpenterControllerRole-${CLUSTER_NAME}" > karpenter.yaml
+
+####### Set the affinity so that Karpenter runs on one of the existing node group nodes. #######
+####### Find the deployment affinity rule, and then modify it in the karpenter.yaml file that you just created: #######
+
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - key: karpenter.sh/provisioner-name
+          operator: DoesNotExist
+      - matchExpressions:
+        - key: eks.amazonaws.com/nodegroup
+          operator: In
+          values:
+          - ${NODEGROUP}
+
+---------------------------------------------------------------------------------------------------------------------------------------
+####### Create the Karpenter namespace #######
+
+Create the required Karpenter Namespace and the provisioner CRD. Then, deploy the rest of Karpenter's resources.
+
+kubectl create namespace karpenter
+kubectl create -f https://raw.githubusercontent.com/aws/karpenter/${KARPENTER_VERSION}/pkg/apis/crds/karpenter.sh_provisioners.yaml
+kubectl create -f https://raw.githubusercontent.com/aws/karpenter/${KARPENTER_VERSION}/pkg/apis/crds/karpenter.k8s.aws_awsnodetemplates.yaml
+kubectl apply -f karpenter.yaml
+
+'
+---------------------------------------------------------------------------------------------------------------------------------------
+####### Create a Provisioner.yaml file #######
+
+apiVersion: karpenter.sh/v1alpha5
+kind: Provisioner
+metadata:
+  name: default
+  namespace: karpenter
+spec:
+  # Enables consolidation which attempts to reduce cluster cost by both removing un-needed nodes and down-sizing those
+  # that can't be removed.  Mutually exclusive with the ttlSecondsAfterEmpty parameter.
+  consolidation:
+    enabled: true
+  requirements:
+    - key: karpenter.k8s.aws/instance-category
+      operator: In
+      values: ["m","c","t"]
+    - key: node.kubernetes.io/instance-type
+      operator: In
+      values: ["m5.xlarge","m5.large","c5.xlarge","t3.small","t3.large","t3.medium"]
+    - key: karpenter.k8s.aws/instance-generation
+      operator: Gt
+      values: ["2"]
+    - key: kubernetes.io/arch
+      operator: In
+      values: ["amd64"]
+    - key: karpenter.sh/capacity-type
+      operator: In
+      values: ["on-demand"]
+  providerRef:
+    name: default
+      #ttlSecondsAfterEmpty: 30
+
+---------------------------------------------------------------------------------------------------------------------------------------
+####### Create a NodeTemplate.yaml #######
+
+apiVersion: karpenter.k8s.aws/v1alpha1
+kind: AWSNodeTemplate
+metadata:
+  name: default
+spec:
+  subnetSelector:
+    karpenter.sh/discovery: "CLUSTER_NAME"
+  securityGroupSelector:
+    karpenter.sh/discovery: "CLUSTER_NAME"
+  blockDeviceMappings:
+    - deviceName: /dev/xvda
+      ebs:
+        volumeSize: 100Gi
+        volumeType: gp3
+        iops: 3000
+        encrypted: false
+        deleteOnTermination: true
+        throughput: 125
+
+---------------------------------------------------------------------------------------------------------------------------------------
+
+####### Scale and verify Karpenter #######
+
+Use the following steps to scale your node group to a minimum size of at least two nodes to support Karpenter and other critical services.
+
+####### Configure scaling: #######
+
+aws eks update-nodegroup-config --cluster-name ${CLUSTER_NAME} --nodegroup-name ${NODEGROUP} --scaling-config "minSize=2,maxSize=2,desiredSize=2"
+
+####### Scale your workloads, and then verify that Karpenter is creating the new nodes to provision your workloads: #######
+
+kubectl logs -f -n karpenter -c controller -l app.kubernetes.io/name=karpenter
+
+####### Note: If you notice any webhook.DefaultingWebhook Reconcile error in the controller logs, restart your Karpenter pods to fix it. #######
+
+####### Run the following command to check the status of the nodes:
+
+kubectl get nodes
+
+
